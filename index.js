@@ -5,6 +5,18 @@ const nodemailer = require('nodemailer');
 const pool = require('./db');
 require('dotenv').config();
 
+const { Client, Environment, OrdersController } = require('@paypal/paypal-server-sdk');
+
+const paypalClient = new Client({
+  clientCredentialsAuthCredentials: {
+    oAuthClientId: process.env.PAYPAL_CLIENT_ID,
+    oAuthClientSecret: process.env.PAYPAL_CLIENT_SECRET,
+  },
+  environment: Environment.Sandbox,
+});
+
+const ordersController = new OrdersController(paypalClient);
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -216,6 +228,69 @@ app.patch('/pedidos/:id/estatus', verificarToken, soloAdminOVendedor, async (req
     );
 
     res.json({ mensaje: 'Estatus actualizado', pedido });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== PAYPAL ====================
+
+// POST - Crear orden de pago en PayPal
+app.post('/paypal/crear-orden', verificarToken, async (req, res) => {
+  const { total } = req.body;
+  try {
+    const order = await ordersController.createOrder({
+      body: {
+        intent: 'CAPTURE',
+        purchaseUnits: [{
+          amount: {
+            currencyCode: 'MXN',
+            value: total.toString()
+          }
+        }]
+      }
+    });
+    res.json({ id: order.result.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST - Capturar pago aprobado por PayPal
+app.post('/paypal/capturar-orden/:orderID', verificarToken, async (req, res) => {
+  const { orderID } = req.params;
+  const { pedido_id } = req.body;
+  try {
+    const capture = await ordersController.captureOrder({
+      id: orderID
+    });
+
+    if (capture.result.status === 'COMPLETED') {
+      // Actualizar estatus del pedido a pagado
+      await pool.query(
+        'UPDATE orders SET estatus = $1, paypal_order_id = $2 WHERE id = $3',
+        ['pagado', orderID, pedido_id]
+      );
+
+      // Registrar el pago
+      await pool.query(
+        'INSERT INTO payments (order_id, paypal_order_id, estatus, monto) VALUES ($1, $2, $3, $4)',
+        [pedido_id, orderID, 'COMPLETED', capture.result.purchaseUnits[0].payments.captures[0].amount.value]
+      );
+
+      // Notificar al admin
+      await enviarCorreo(
+        process.env.EMAIL_ADMIN,
+        `Pago confirmado para pedido #${pedido_id}`,
+        `<h2>Pago confirmado</h2>
+         <p>El pedido <b>#${pedido_id}</b> ha sido pagado correctamente via PayPal.</p>
+         <p><b>ID de transacción:</b> ${orderID}</p>`
+      );
+
+      res.json({ mensaje: 'Pago completado', status: 'COMPLETED' });
+    } else {
+      res.status(400).json({ error: 'Pago no completado' });
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
