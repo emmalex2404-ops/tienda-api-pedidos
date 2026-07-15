@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+const axios = require('axios');
 const pool = require('./db');
 require('dotenv').config();
 
@@ -80,6 +81,10 @@ app.get('/carrito', verificarToken, async (req, res) => {
 app.post('/carrito', verificarToken, async (req, res) => {
   const { product_id, cantidad } = req.body;
   try {
+    // Obtener precio del producto desde API R1
+    const productoRes = await axios.get(`http://localhost:3001/productos/${product_id}`);
+    const precio = productoRes.data.precio;
+
     const existe = await pool.query(
       'SELECT * FROM cart_items WHERE user_id = $1 AND product_id = $2',
       [req.usuario.id, product_id]
@@ -92,8 +97,8 @@ app.post('/carrito', verificarToken, async (req, res) => {
       return res.json(result.rows[0]);
     }
     const result = await pool.query(
-      'INSERT INTO cart_items (user_id, product_id, cantidad) VALUES ($1, $2, $3) RETURNING *',
-      [req.usuario.id, product_id, cantidad]
+      'INSERT INTO cart_items (user_id, product_id, cantidad, precio) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.usuario.id, product_id, cantidad, precio]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -149,7 +154,6 @@ app.post('/pedidos', verificarToken, async (req, res) => {
 
     await pool.query('DELETE FROM cart_items WHERE user_id = $1', [req.usuario.id]);
 
-    // Notificar al admin
     await enviarCorreo(
       process.env.EMAIL_ADMIN,
       `Nuevo pedido #${orderId} recibido`,
@@ -217,7 +221,6 @@ app.patch('/pedidos/:id/estatus', verificarToken, soloAdminOVendedor, async (req
 
     const pedido = result.rows[0];
 
-    // Notificar al cliente
     await enviarCorreo(
       process.env.EMAIL_USER,
       `Tu pedido #${id} fue actualizado`,
@@ -235,7 +238,6 @@ app.patch('/pedidos/:id/estatus', verificarToken, soloAdminOVendedor, async (req
 
 // ==================== PAYPAL ====================
 
-// POST - Crear orden de pago en PayPal
 app.post('/paypal/crear-orden', verificarToken, async (req, res) => {
   const { total } = req.body;
   try {
@@ -256,29 +258,21 @@ app.post('/paypal/crear-orden', verificarToken, async (req, res) => {
   }
 });
 
-// POST - Capturar pago aprobado por PayPal
 app.post('/paypal/capturar-orden/:orderID', verificarToken, async (req, res) => {
   const { orderID } = req.params;
   const { pedido_id } = req.body;
   try {
-    const capture = await ordersController.captureOrder({
-      id: orderID
-    });
+    const capture = await ordersController.captureOrder({ id: orderID });
 
     if (capture.result.status === 'COMPLETED') {
-      // Actualizar estatus del pedido a pagado
       await pool.query(
         'UPDATE orders SET estatus = $1, paypal_order_id = $2 WHERE id = $3',
         ['pagado', orderID, pedido_id]
       );
-
-      // Registrar el pago
       await pool.query(
         'INSERT INTO payments (order_id, paypal_order_id, estatus, monto) VALUES ($1, $2, $3, $4)',
         [pedido_id, orderID, 'COMPLETED', capture.result.purchaseUnits[0].payments.captures[0].amount.value]
       );
-
-      // Notificar al admin
       await enviarCorreo(
         process.env.EMAIL_ADMIN,
         `Pago confirmado para pedido #${pedido_id}`,
@@ -286,7 +280,6 @@ app.post('/paypal/capturar-orden/:orderID', verificarToken, async (req, res) => 
          <p>El pedido <b>#${pedido_id}</b> ha sido pagado correctamente via PayPal.</p>
          <p><b>ID de transacción:</b> ${orderID}</p>`
       );
-
       res.json({ mensaje: 'Pago completado', status: 'COMPLETED' });
     } else {
       res.status(400).json({ error: 'Pago no completado' });
